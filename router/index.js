@@ -1,21 +1,23 @@
 import express from 'express';
 import fetch from 'node-fetch';
-import { createProxyMiddleware } from 'http-proxy-middleware';
 
 const app = express();
-const IDLE_TIMEOUT_MS = parseInt(process.env.IDLE_TIMEOUT_SECONDS ?? '300') * 1000;
+const IDLE_TIMEOUT_MS = parseInt(process.env.IDLE_TIMEOUT_SECONDS ?? '120') * 1000;
 
 const MODEL_MAP = {
-  'qwen2.5-0.5b': { host: 'vllm-qwen05',  port: 8001 },
-  'qwen3.5-0.8b': { host: 'vllm-qwen08',  port: 8002 },
-  'qwen2.5':      { host: 'vllm-qwen',     port: 8003 },
+  'qwen2.5-0.5b': { host: 'vllm-qwen05', port: 8001 },
+  'qwen3.5-0.8b': { host: 'vllm-qwen08', port: 8002 },
+  'qwen2.5':      { host: 'vllm-qwen',   port: 8003 },
 };
 
+// 'loading' → 'asleep' → 'waking' → 'awake' → 'sleeping' → 'asleep'
 const state = Object.fromEntries(Object.keys(MODEL_MAP).map(k => [k, 'loading']));
-const idleTimers = {};
-const wakeQueue = {};
 
-// ── vLLM HTTP helpers ─────────────────────────────────────────────────────────
+let activeModel   = null;   // model currently on the GPU
+let switchMutex   = null;   // serializes all wake/sleep transitions
+const idleTimers  = {};
+
+// ── vLLM helpers ──────────────────────────────────────────────────────────────
 
 async function vllmPost(modelName, path) {
   const { host, port } = MODEL_MAP[modelName];
@@ -26,7 +28,6 @@ async function vllmPost(modelName, path) {
   if (!res.ok) throw new Error(`POST /${path} failed for ${modelName}: HTTP ${res.status}`);
 }
 
-// Single probe of /v1/models — returns true if model is loaded
 async function probeLoaded(modelName) {
   const { host, port } = MODEL_MAP[modelName];
   try {
@@ -34,12 +35,9 @@ async function probeLoaded(modelName) {
       signal: AbortSignal.timeout(3000),
     });
     return r.ok;
-  } catch {
-    return false;
-  }
+  } catch { return false; }
 }
 
-// Poll /is_sleeping after wake_up — returns true when awake
 async function waitUntilAwake(modelName, timeoutMs = 30_000) {
   const { host, port } = MODEL_MAP[modelName];
   const deadline = Date.now() + timeoutMs;
@@ -58,57 +56,72 @@ async function waitUntilAwake(modelName, timeoutMs = 30_000) {
   throw new Error(`${modelName} did not wake within ${timeoutMs / 1000}s`);
 }
 
-// ── Wake / sleep ──────────────────────────────────────────────────────────────
+// ── Idle timer ────────────────────────────────────────────────────────────────
 
-async function wakeModel(modelName) {
-  if (state[modelName] === 'awake') return;
-  if (state[modelName] === 'loading') throw new Error(`${modelName} is still loading`);
-  if (wakeQueue[modelName]) return wakeQueue[modelName];
-
-  wakeQueue[modelName] = (async () => {
-    console.log(`[router] waking ${modelName}…`);
-    state[modelName] = 'waking';
-    try {
-      await vllmPost(modelName, 'wake_up');
-      await waitUntilAwake(modelName, 30_000);
-      state[modelName] = 'awake';
-      console.log(`[router] ${modelName} awake`);
-    } catch (e) {
-      state[modelName] = 'asleep';
-      throw e;
-    } finally {
-      delete wakeQueue[modelName];
-    }
-  })();
-
-  return wakeQueue[modelName];
-}
-
-async function sleepModel(modelName) {
-  if (state[modelName] !== 'awake') return;
-  console.log(`[router] sleeping ${modelName}…`);
-  state[modelName] = 'sleeping';
-  try {
-    await vllmPost(modelName, 'sleep');
-    state[modelName] = 'asleep';
-    console.log(`[router] ${modelName} asleep`);
-  } catch (e) {
-    state[modelName] = 'awake';
-    console.error(`[router] sleep failed for ${modelName}:`, e.message);
-  }
+function clearIdleTimer(modelName) {
+  clearTimeout(idleTimers[modelName]);
+  delete idleTimers[modelName];
 }
 
 function resetIdleTimer(modelName) {
-  clearTimeout(idleTimers[modelName]);
-  idleTimers[modelName] = setTimeout(() => sleepModel(modelName), IDLE_TIMEOUT_MS);
+  clearIdleTimer(modelName);
+  idleTimers[modelName] = setTimeout(async () => {
+    console.log(`[router] ${modelName} idle timeout — sleeping…`);
+    await switchTo(null);
+  }, IDLE_TIMEOUT_MS);
 }
 
-// ── Boot: poll each model independently, never reset progress on retry ────────
+// ── Core: serialized GPU switch ───────────────────────────────────────────────
 //
-// Each model transitions: loading → asleep (once /v1/models returns 200 and
-// we've called /sleep). The boot loop runs until all models are out of
-// 'loading'. The router starts accepting requests immediately — models that
-// finish early are available while others are still loading.
+// switchTo(targetModel) ensures:
+//   1. Any currently active model is put to sleep first
+//   2. The target model (if not null) is woken and confirmed awake
+//   3. Only one switch runs at a time — concurrent callers queue behind the mutex
+
+async function switchTo(targetModel) {
+  // Chain onto the existing mutex so transitions never overlap
+  switchMutex = (switchMutex ?? Promise.resolve()).then(async () => {
+    // Nothing to do if already in the right state
+    if (targetModel === activeModel) return;
+
+    // Sleep the current active model
+    if (activeModel !== null && state[activeModel] === 'awake') {
+      const prev = activeModel;
+      console.log(`[router] sleeping ${prev} to free GPU…`);
+      state[prev] = 'sleeping';
+      clearIdleTimer(prev);
+      try {
+        await vllmPost(prev, 'sleep');
+        state[prev] = 'asleep';
+        console.log(`[router] ${prev} asleep`);
+      } catch (e) {
+        console.error(`[router] sleep failed for ${prev}:`, e.message);
+        state[prev] = 'awake'; // leave state consistent
+      }
+      activeModel = null;
+    }
+
+    // Wake the target model
+    if (targetModel !== null) {
+      console.log(`[router] waking ${targetModel}…`);
+      state[targetModel] = 'waking';
+      try {
+        await vllmPost(targetModel, 'wake_up');
+        await waitUntilAwake(targetModel);
+        state[targetModel] = 'awake';
+        activeModel = targetModel;
+        console.log(`[router] ${targetModel} awake and active`);
+      } catch (e) {
+        state[targetModel] = 'asleep';
+        throw e;
+      }
+    }
+  });
+
+  return switchMutex;
+}
+
+// ── Boot ──────────────────────────────────────────────────────────────────────
 
 async function sleepOneModel(name) {
   try {
@@ -116,31 +129,23 @@ async function sleepOneModel(name) {
     state[name] = 'asleep';
     console.log(`[router] ${name} loaded and asleep`);
   } catch (e) {
-    // Sleep failed — leave awake, idle timer will retry
+    // If sleep fails at boot just mark it awake — idle timer will sleep it
     state[name] = 'awake';
+    activeModel  = name;
     resetIdleTimer(name);
     console.warn(`[router] ${name} loaded but sleep failed:`, e.message);
   }
 }
 
 async function boot() {
-  console.log('[router] boot — polling each vLLM model until loaded (no timeout)…');
-
-  // Start the HTTP server immediately so Open WebUI can connect
-  // Models in 'loading' state return 503 until ready
+  console.log('[router] boot — polling each vLLM model until loaded…');
   app.listen(8000, () => console.log('[router] listening on :8000'));
 
-  // Poll all models in parallel, independently, forever until each is loaded
   await Promise.all(
     Object.keys(MODEL_MAP).map(async name => {
-      let logged = false;
+      console.log(`[router] waiting for ${name} to finish loading…`);
       while (true) {
-        if (!logged) {
-          console.log(`[router] waiting for ${name} to finish loading…`);
-          logged = true;
-        }
-        const ready = await probeLoaded(name);
-        if (ready) {
+        if (await probeLoaded(name)) {
           console.log(`[router] ${name} finished loading — sleeping…`);
           await sleepOneModel(name);
           return;
@@ -150,35 +155,38 @@ async function boot() {
     })
   );
 
-  console.log('[router] all models loaded and asleep — fully ready');
+  console.log('[router] all models loaded and asleep — ready');
 }
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 
 app.get('/v1/models', (_req, res) => {
-  // Only advertise models that have finished loading
-  const ready = Object.entries(state)
+  const data = Object.entries(state)
     .filter(([, s]) => s !== 'loading')
     .map(([id]) => ({ id, object: 'model', owned_by: 'vllm', created: 0 }));
-
-  res.json({ object: 'list', data: ready });
+  res.json({ object: 'list', data });
 });
 
 app.get('/status', (_req, res) => {
-  res.json(
-    Object.fromEntries(
-      Object.entries(state).map(([k, v]) => [k, { state: v, ...MODEL_MAP[k] }])
-    )
-  );
+  res.json(Object.fromEntries(
+    Object.entries(state).map(([k, v]) => [
+      k, { state: v, active: activeModel === k, ...MODEL_MAP[k] }
+    ])
+  ));
 });
 
-app.use('/v1', async (req, res, next) => {
-  let rawBody = '';
-  await new Promise(resolve => { req.on('data', c => rawBody += c); req.on('end', resolve); });
-  req.rawBody = rawBody;
+// ── Main proxy ────────────────────────────────────────────────────────────────
 
+app.use('/v1', async (req, res) => {
+  // Buffer body
+  const chunks = [];
+  for await (const chunk of req) chunks.push(chunk);
+  const rawBody = Buffer.concat(chunks);
+
+  // Extract model name
   let modelName;
-  try { modelName = rawBody ? JSON.parse(rawBody).model : req.query.model; } catch {}
+  try { modelName = JSON.parse(rawBody.toString()).model; } catch {}
+  if (!modelName) modelName = req.query.model;
 
   const entry = MODEL_MAP[modelName];
   if (!entry) {
@@ -188,35 +196,39 @@ app.use('/v1', async (req, res, next) => {
   }
 
   if (state[modelName] === 'loading') {
-    return res.status(503).json({
-      error: `${modelName} is still loading, try again shortly`,
-    });
+    return res.status(503).json({ error: `${modelName} is still loading, try again shortly` });
   }
 
+  // Switch GPU to the requested model (sleeps any other active model first)
   try {
-    await wakeModel(modelName);
+    await switchTo(modelName);
   } catch (e) {
-    return res.status(503).json({ error: `Failed to wake ${modelName}: ${e.message}` });
+    return res.status(503).json({ error: `Failed to switch to ${modelName}: ${e.message}` });
   }
 
+  // Reset idle timer — 2 min of silence will sleep this model
   resetIdleTimer(modelName);
 
+  // Forward request
   const { host, port } = entry;
-  createProxyMiddleware({
-    target: `http://${host}:${port}`,
-    changeOrigin: true,
-    on: {
-      proxyReq(proxyReq) {
-        if (req.rawBody) {
-          proxyReq.setHeader('content-length', Buffer.byteLength(req.rawBody));
-          proxyReq.write(req.rawBody);
-          proxyReq.end();
-        }
-      },
-    },
-  })(req, res, next);
+  const url = `http://${host}:${port}${req.originalUrl}`;
+  const headers = { ...req.headers, host: `${host}:${port}` };
+
+  try {
+    const upstream = await fetch(url, {
+      method:  req.method,
+      headers,
+      body:    rawBody.length ? rawBody : undefined,
+    });
+
+    res.status(upstream.status);
+    upstream.headers.forEach((v, k) => res.setHeader(k, v));
+    upstream.body.pipe(res);
+  } catch (e) {
+    console.error(`[router] proxy error for ${modelName}:`, e.message);
+    if (!res.headersSent) res.status(502).json({ error: `Upstream error: ${e.message}` });
+  }
 });
 
 // ── Start ─────────────────────────────────────────────────────────────────────
-// boot() never throws — errors per model are logged and retried internally
 boot().catch(e => console.error('[router] unexpected boot error:', e));
