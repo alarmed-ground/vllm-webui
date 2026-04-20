@@ -1,0 +1,133 @@
+networks:
+  vllm-net:
+    driver: bridge
+
+services:
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui
+    ports:
+      - "3000:8080"
+    environment:
+      - OPENAI_API_BASE_URL=http://router:8000/v1
+      - OPENAI_API_KEY=none
+    volumes:
+      - open-webui-data:/app/backend/data
+    depends_on:
+      - router
+    networks:
+      - vllm-net
+    restart: unless-stopped
+
+  router:
+    build: ./router
+    container_name: router
+    ports:
+      - "8000:8000"
+    environment:
+      - IDLE_TIMEOUT_SECONDS=120
+    depends_on:
+      - vllm-qwen05
+      - vllm-qwen08
+      - vllm-qwen
+    networks:
+      - vllm-net
+    restart: unless-stopped
+
+  vllm-qwen05:
+    build: ./vllm-entrypoint
+    container_name: vllm-qwen05
+    runtime: nvidia
+    ipc: host
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN}
+      - MODEL_NAME=Qwen/Qwen2.5-0.5B-Instruct
+      - VLLM_SERVER_DEV_MODE=1
+    command: >
+      --model Qwen/Qwen2.5-0.5B-Instruct
+      --served-model-name qwen2.5-0.5b
+      --port 8001
+      --dtype auto
+      --gpu-memory-utilization 0.45
+      --enable-sleep-mode
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+    expose:
+      - "8001"
+    networks:
+      - vllm-net
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  vllm-qwen08:
+    build: ./vllm-entrypoint
+    container_name: vllm-qwen08
+    runtime: nvidia
+    ipc: host
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN}
+      - MODEL_NAME=Qwen/Qwen3.5-0.8B
+      - VLLM_SERVER_DEV_MODE=1
+    command: >
+      --model Qwen/Qwen3.5-0.8B
+      --served-model-name qwen3.5-0.8b
+      --port 8002
+      --dtype auto
+      --gpu-memory-utilization 0.8
+      --enable-sleep-mode
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+    expose:
+      - "8002"
+    networks:
+      - vllm-net
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  vllm-qwen:
+    build: ./vllm-entrypoint
+    container_name: vllm-qwen
+    runtime: nvidia
+    ipc: host
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN}
+      - MODEL_NAME=Qwen/Qwen2.5-7B-Instruct
+      - VLLM_SERVER_DEV_MODE=1
+    command: >
+      --model Qwen/Qwen2.5-7B-Instruct
+      --served-model-name qwen2.5
+      --port 8003
+      --dtype auto
+      --gpu-memory-utilization 0.8
+      --enable-sleep-mode
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+    expose:
+      - "8003"
+    networks:
+      - vllm-net
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+
+volumes:
+  open-webui-data:
+  hf-cache:
